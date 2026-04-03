@@ -8,7 +8,7 @@ on:
 jobs:
   bag-preview:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Set up Python
@@ -19,177 +19,244 @@ jobs:
       - name: Install Python packages
         run: |
           python -m pip install --upgrade pip
-          pip install feedparser requests
+          pip install requests
 
-      - name: Download latest full PDOK address dataset
+      - name: Download latest full PDOK Adressen dataset, preview it, and print random addresses
         env:
           BAG_ADRESSEN_ATOM_FEED: https://service.pdok.nl/kadaster/bag-adressen/atom/index.xml
         run: |
           python - <<'PY'
+          import gzip
           import os
+          import random
           import re
+          import sqlite3
           import sys
+          import xml.etree.ElementTree as ET
           import zipfile
           from pathlib import Path
           from urllib.parse import urlparse
-
-          import feedparser
           import requests
 
-          out_dir = Path("bag_data")
-          out_dir.mkdir(parents=True, exist_ok=True)
+          FEED_URL = os.environ["BAG_ADRESSEN_ATOM_FEED"]
+          WORKDIR = Path("bag_data")
+          WORKDIR.mkdir(parents=True, exist_ok=True)
 
-          feed_url = os.environ["BAG_ADRESSEN_ATOM_FEED"]
-          feed = feedparser.parse(feed_url)
+          session = requests.Session()
+          session.headers.update({"User-Agent": "github-actions-bag-preview/1.0"})
 
-          links = []
-          for entry in feed.entries:
-              for link in entry.get("links", []):
-                  href = link.get("href")
-                  if href and href.startswith("http"):
-                      links.append(href)
-              href = entry.get("link")
-              if href and href.startswith("http"):
-                  links.append(href)
+          def fetch_text(url: str) -> str:
+              r = session.get(url, timeout=180)
+              r.raise_for_status()
+              return r.text
 
-          if not links:
-              raise SystemExit(f"No download links found in {feed_url}")
+          def fetch_bytes(url: str) -> bytes:
+              r = session.get(url, timeout=180)
+              r.raise_for_status()
+              return r.content
 
-          links = list(dict.fromkeys(links))
+          def stream_download(url: str, dest: Path) -> None:
+              with session.get(url, stream=True, timeout=180) as r:
+                  r.raise_for_status()
+                  with dest.open("wb") as f:
+                      for chunk in r.iter_content(chunk_size=1024 * 1024):
+                          if chunk:
+                              f.write(chunk)
 
-          preferred = []
-          fallback = []
-          for link in links:
-              lower = link.lower()
-              if lower.endswith(".gpkg.zip") or lower.endswith(".zip"):
-                  preferred.append(link)
-              else:
-                  fallback.append(link)
+          def local_name_from_url(url: str, fallback: str) -> str:
+              name = Path(urlparse(url).path).name or fallback
+              name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+              return name or fallback
 
-          if preferred:
-              download_url = sorted(preferred, key=len)[0]
-          else:
-              download_url = links[0]
+          def parse_atom_links(xml_text: str) -> list[str]:
+              root = ET.fromstring(xml_text)
+              links = []
 
-          print(f"Feed URL: {feed_url}")
+              for elem in root.iter():
+                  tag = elem.tag.lower()
+                  if tag.endswith("link"):
+                      href = elem.attrib.get("href")
+                      if href and href.startswith("http"):
+                          links.append(href)
+
+              return list(dict.fromkeys(links))
+
+          def score_link(url: str) -> tuple[int, int]:
+              lower = url.lower()
+
+              score = 1000
+
+              if "/downloads/" in lower:
+                  score -= 500
+              if lower.endswith(".gpkg.zip"):
+                  score -= 300
+              elif lower.endswith(".zip"):
+                  score -= 250
+              elif lower.endswith(".gpkg"):
+                  score -= 200
+              elif lower.endswith(".xml.gz"):
+                  score -= 150
+              elif lower.endswith(".xml"):
+                  score -= 100
+              elif lower.endswith(".gml.gz"):
+                  score -= 90
+              elif lower.endswith(".gml"):
+                  score -= 80
+
+              if "geonetwork" in lower or "getrecordbyid" in lower or "metadata" in lower or "/srv/" in lower:
+                  score += 800
+
+              return (score, len(url))
+
+          print(f"Feed URL: {FEED_URL}")
+          feed_xml = fetch_text(FEED_URL)
+          atom_links = parse_atom_links(feed_xml)
+
+          if not atom_links:
+              raise SystemExit("No links found in ATOM feed")
+
+          download_candidates = []
+          for url in atom_links:
+              lower = url.lower()
+              if "/downloads/" in lower:
+                  download_candidates.append(url)
+              elif re.search(r"\.(gpkg\.zip|zip|gpkg|xml\.gz|xml|gml\.gz|gml)$", lower):
+                  download_candidates.append(url)
+
+          download_candidates = list(dict.fromkeys(download_candidates))
+
+          if not download_candidates:
+              raise SystemExit(
+                  "No dataset download candidates found in feed. "
+                  "The feed may have changed format."
+              )
+
+          download_url = sorted(download_candidates, key=score_link)[0]
           print(f"Resolved download URL: {download_url}")
 
-          filename = Path(urlparse(download_url).path).name or "bag_adressen_download.zip"
-          filename = re.sub(r"[^A-Za-z0-9._-]+", "_", filename)
-          zip_path = out_dir / filename
+          filename = local_name_from_url(download_url, "bag_adressen_download")
+          download_path = WORKDIR / filename
 
-          with requests.get(download_url, stream=True, timeout=180) as r:
-              r.raise_for_status()
-              with zip_path.open("wb") as f:
-                  for chunk in r.iter_content(chunk_size=1024 * 1024):
-                      if chunk:
-                          f.write(chunk)
+          print("Downloading dataset...")
+          stream_download(download_url, download_path)
 
-          size = zip_path.stat().st_size
-          print(f"Downloaded: {zip_path}")
+          size = download_path.stat().st_size
+          print(f"Downloaded: {download_path}")
           print(f"Size bytes: {size}")
 
           if size < 1024:
               raise SystemExit("Downloaded file is unexpectedly small")
 
-          with zip_path.open("rb") as f:
+          with download_path.open("rb") as f:
               head = f.read(512).lower()
               if b"<html" in head:
-                  raise SystemExit("Download looks like an HTML error page, not a dataset")
+                  raise SystemExit("Download looks like an HTML page instead of dataset content")
+              if b"getrecordbyid" in head:
+                  raise SystemExit("Resolved URL still points to metadata instead of actual dataset")
 
-          with zipfile.ZipFile(zip_path, "r") as zf:
-              names = zf.namelist()
-              if not names:
-                  raise SystemExit("ZIP file is empty")
-              bad = zf.testzip()
-              if bad is not None:
-                  raise SystemExit(f"ZIP file is corrupt at member: {bad}")
-              zf.extractall(out_dir / "unzipped")
+          extract_dir = WORKDIR / "unzipped"
+          extract_dir.mkdir(exist_ok=True)
 
-          print("Top-level extracted files:")
-          for p in sorted((out_dir / "unzipped").rglob("*")):
+          gpkg_path = None
+
+          lower_name = download_path.name.lower()
+
+          if lower_name.endswith(".zip"):
+              print("Archive type: ZIP")
+              with zipfile.ZipFile(download_path, "r") as zf:
+                  names = zf.namelist()
+                  if not names:
+                      raise SystemExit("ZIP file is empty")
+                  bad = zf.testzip()
+                  if bad is not None:
+                      raise SystemExit(f"ZIP file is corrupt at member: {bad}")
+                  zf.extractall(extract_dir)
+
+              gpkg_files = list(extract_dir.rglob("*.gpkg"))
+              if gpkg_files:
+                  gpkg_path = gpkg_files[0]
+
+          elif lower_name.endswith(".gpkg"):
+              print("Archive type: raw GeoPackage")
+              gpkg_path = download_path
+
+          elif lower_name.endswith(".gz"):
+              print("Archive type: GZip")
+              out_name = download_path.with_suffix("")
+              with gzip.open(download_path, "rb") as src, out_name.open("wb") as dst:
+                  dst.write(src.read())
+              if out_name.suffix.lower() == ".gpkg":
+                  gpkg_path = out_name
+
+          else:
+              raise SystemExit(f"Unsupported downloaded file type: {download_path.name}")
+
+          print("Extracted files:")
+          for p in sorted(WORKDIR.rglob("*")):
               if p.is_file():
                   print(f" - {p}")
 
-          gpkg_files = list((out_dir / "unzipped").rglob("*.gpkg"))
-          if not gpkg_files:
-              raise SystemExit("No .gpkg file found after extraction")
+          if gpkg_path is None or not gpkg_path.exists():
+              raise SystemExit(
+                  "No .gpkg file found. This workflow expects the PDOK address download to contain a GeoPackage."
+              )
 
-          gpkg_path = gpkg_files[0]
-          print(f"GPKG_PATH={gpkg_path}", file=open(os.environ["GITHUB_ENV"], "a"))
-          print(f"ZIP_PATH={zip_path}", file=open(os.environ["GITHUB_ENV"], "a"))
           print(f"Using GeoPackage: {gpkg_path}")
-          PY
-
-      - name: Preview schema and sample addresses
-        run: |
-          python - <<'PY'
-          import os
-          import sqlite3
-          from pathlib import Path
-
-          gpkg_path = Path(os.environ["GPKG_PATH"])
-          if not gpkg_path.exists():
-              raise SystemExit(f"GeoPackage not found: {gpkg_path}")
 
           conn = sqlite3.connect(str(gpkg_path))
           conn.row_factory = sqlite3.Row
 
-          def quote_ident(name: str) -> str:
+          def qident(name: str) -> str:
               return '"' + name.replace('"', '""') + '"'
 
           tables = [
               r["table_name"]
-              for r in conn.execute(
-                  "SELECT table_name FROM gpkg_contents ORDER BY table_name"
-              ).fetchall()
+              for r in conn.execute("SELECT table_name FROM gpkg_contents ORDER BY table_name").fetchall()
           ]
 
           if not tables:
               raise SystemExit("No tables found in GeoPackage")
 
-          print("=== TABLES ===")
+          print("\n=== TABLES ===")
           for t in tables:
               print("-", t)
 
-          chosen_table = None
-          chosen_columns = None
-
-          score_keywords = {
-              "postcode": 5,
-              "huisnummer": 5,
-              "openbareruimtenaam": 3,
-              "straat": 3,
-              "woonplaatsnaam": 3,
-              "nummeraanduiding": 2,
-          }
-
+          best_table = None
+          best_cols = None
           best_score = -1
 
+          wanted = {
+              "postcode": 6,
+              "huisnummer": 6,
+              "openbareruimtenaam": 4,
+              "straat": 3,
+              "woonplaatsnaam": 4,
+              "nummeraanduiding": 1,
+          }
+
           for table in tables:
-              cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({quote_ident(table)})")]
-              lower_cols = {c.lower(): c for c in cols}
+              cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({qident(table)})").fetchall()]
               score = 0
-              for key, pts in score_keywords.items():
-                  if key in lower_cols:
+              lower_cols = {c.lower(): c for c in cols}
+              for k, pts in wanted.items():
+                  if k in lower_cols:
                       score += pts
               if score > best_score:
                   best_score = score
-                  chosen_table = table
-                  chosen_columns = cols
+                  best_table = table
+                  best_cols = cols
 
-          if not chosen_table or not chosen_columns:
-              raise SystemExit("Could not determine a suitable address table")
+          if not best_table or not best_cols:
+              raise SystemExit("Could not find a usable address table")
 
           print("\n=== CHOSEN TABLE ===")
-          print(chosen_table)
+          print(best_table)
 
           print("\n=== COLUMNS ===")
-          for c in chosen_columns:
+          for c in best_cols:
               print("-", c)
 
-          lower_map = {c.lower(): c for c in chosen_columns}
-
+          lower_map = {c.lower(): c for c in best_cols}
           postcode_col = lower_map.get("postcode")
           huisnummer_col = lower_map.get("huisnummer")
           straat_col = lower_map.get("openbareruimtenaam") or lower_map.get("straat")
@@ -197,42 +264,45 @@ jobs:
 
           if not postcode_col or not huisnummer_col:
               raise SystemExit(
-                  f"Required columns not found in {chosen_table}. "
-                  f"Need at least postcode and huisnummer."
+                  f"Could not find required postcode/huisnummer columns in {best_table}"
               )
 
-          select_cols = [c for c in [straat_col, huisnummer_col, postcode_col, woonplaats_col] if c]
-          select_expr = ", ".join(quote_ident(c) for c in select_cols)
-          table_expr = quote_ident(chosen_table)
+          selected_cols = [c for c in [straat_col, huisnummer_col, postcode_col, woonplaats_col] if c]
+          select_sql = ", ".join(qident(c) for c in selected_cols)
+          table_sql = qident(best_table)
 
           print("\n=== PREVIEW (first 10 rows) ===")
-          q1 = f"SELECT {select_expr} FROM {table_expr} LIMIT 10"
-          rows = conn.execute(q1).fetchall()
-          for i, row in enumerate(rows, 1):
-              print(f"{i:02d} | " + " | ".join(str(row[c]) for c in select_cols))
+          preview_rows = conn.execute(
+              f"SELECT {select_sql} FROM {table_sql} LIMIT 10"
+          ).fetchall()
 
-          print("\n=== RANDOM SAMPLE OF 10 ADDRESSES ===")
+          for i, row in enumerate(preview_rows, 1):
+              print(f"{i:02d} | " + " | ".join(str(row[c]) for c in selected_cols))
+
           where_parts = [
-              f"{quote_ident(postcode_col)} IS NOT NULL",
-              f"{quote_ident(huisnummer_col)} IS NOT NULL",
+              f"{qident(postcode_col)} IS NOT NULL",
+              f"{qident(huisnummer_col)} IS NOT NULL",
           ]
           if straat_col:
-              where_parts.append(f"{quote_ident(straat_col)} IS NOT NULL")
+              where_parts.append(f"{qident(straat_col)} IS NOT NULL")
           if woonplaats_col:
-              where_parts.append(f"{quote_ident(woonplaats_col)} IS NOT NULL")
+              where_parts.append(f"{qident(woonplaats_col)} IS NOT NULL")
 
-          where_clause = " AND ".join(where_parts)
+          where_sql = " AND ".join(where_parts)
 
-          q2 = f"""
-              SELECT {select_expr}
-              FROM {table_expr}
-              WHERE {where_clause}
+          print("\n=== RANDOM SAMPLE OF 10 ADDRESSES ===")
+          sample_rows = conn.execute(
+              f"""
+              SELECT {select_sql}
+              FROM {table_sql}
+              WHERE {where_sql}
               ORDER BY RANDOM()
               LIMIT 10
-          """
-          rows = conn.execute(q2).fetchall()
-          for i, row in enumerate(rows, 1):
-              print(f"{i:02d} | " + " | ".join(str(row[c]) for c in select_cols))
+              """
+          ).fetchall()
+
+          for i, row in enumerate(sample_rows, 1):
+              print(f"{i:02d} | " + " | ".join(str(row[c]) for c in selected_cols))
 
           conn.close()
           PY
