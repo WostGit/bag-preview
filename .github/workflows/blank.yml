@@ -8,159 +8,365 @@ on:
 jobs:
   bag-preview:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: Show runner info
+        run: |
+          echo "=== SYSTEM INFO ==="
+          uname -a || true
+          echo
+          echo "=== PYTHON ==="
+          python3 --version || true
+          which python3 || true
+          echo
+          echo "=== DISK ==="
+          df -h || true
+          echo
+          echo "=== NETWORK TOOLS ==="
+          which curl || true
+          which unzip || true
 
-      - name: Download BAG extract and print previews
+      - name: Download, inspect, extract, preview, and sample BAG dataset
         env:
           BAG_ZIP_URL: https://service.pdok.nl/kadaster/bag-adressen/atom/downloads/lvbag-extract-nl.zip
+        shell: bash
         run: |
-          python - <<'PY'
-          import os
-          import re
-          import zipfile
-          import xml.etree.ElementTree as ET
+          set -Eeuo pipefail
+
+          echo "=== STARTING BAG WORKFLOW ==="
+          echo "BAG_ZIP_URL=${BAG_ZIP_URL}"
+
+          mkdir -p bag_data
+          cd bag_data
+
+          echo
+          echo "=== STEP 1: DOWNLOAD DATASET ==="
+
+          ZIP_NAME="lvbag-extract-nl.zip"
+
+          echo "Downloading with curl..."
+          curl \
+            --fail \
+            --location \
+            --retry 8 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            --connect-timeout 30 \
+            --max-time 7200 \
+            --output "${ZIP_NAME}" \
+            "${BAG_ZIP_URL}"
+
+          echo "Download completed."
+
+          echo
+          echo "=== STEP 2: BASIC FILE CHECKS ==="
+
+          if [ ! -f "${ZIP_NAME}" ]; then
+            echo "ERROR: ZIP file was not created."
+            exit 1
+          fi
+
+          ls -lh "${ZIP_NAME}" || true
+
+          FILE_SIZE=$(wc -c < "${ZIP_NAME}" | tr -d ' ')
+          echo "ZIP size in bytes: ${FILE_SIZE}"
+
+          if [ "${FILE_SIZE}" -lt 1024 ]; then
+            echo "ERROR: Downloaded file is too small to be a real dataset."
+            exit 1
+          fi
+
+          echo
+          echo "First 64 bytes (hex):"
+          python3 - <<'PY'
           from pathlib import Path
-          from urllib.parse import urlparse
-          import random
-          import requests
+          p = Path("lvbag-extract-nl.zip")
+          data = p.read_bytes()[:64]
+          print(data.hex())
+          PY
 
-          out_dir = Path("bag_data")
-          out_dir.mkdir(parents=True, exist_ok=True)
+          echo
+          echo "Checking for HTML/error-page download..."
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("lvbag-extract-nl.zip")
+          head = p.read_bytes()[:2048].lower()
+          suspicious = [
+              b"<html",
+              b"<!doctype html",
+              b"<head",
+              b"<body",
+              b"access denied",
+              b"forbidden",
+              b"not found",
+              b"getrecordbyid",
+          ]
+          bad = [x.decode("utf-8", "ignore") for x in suspicious if x in head]
+          if bad:
+              print("ERROR: Download looks like HTML or metadata, not a ZIP dataset.")
+              print("Matched markers:", bad)
+              raise SystemExit(1)
+          print("Initial content does not look like HTML.")
+          PY
 
-          url = os.environ["BAG_ZIP_URL"]
-          zip_name = Path(urlparse(url).path).name or "lvbag-extract-nl.zip"
-          zip_path = out_dir / zip_name
+          echo
+          echo "=== STEP 3: ZIP VALIDATION ==="
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
 
-          print(f"Downloading: {url}")
-          with requests.get(url, stream=True, timeout=300) as r:
-              r.raise_for_status()
-              with zip_path.open("wb") as f:
-                  for chunk in r.iter_content(chunk_size=1024 * 1024):
-                      if chunk:
-                          f.write(chunk)
+          zip_path = Path("lvbag-extract-nl.zip")
 
-          size = zip_path.stat().st_size
-          print(f"Saved: {zip_path}")
-          print(f"Size: {size} bytes")
+          if not zip_path.exists():
+              raise SystemExit("ERROR: ZIP file does not exist")
 
-          if size < 1024:
-              raise SystemExit("Downloaded file is unexpectedly small")
-
-          with zip_path.open("rb") as f:
-              head = f.read(512).lower()
-              if b"<html" in head:
-                  raise SystemExit("Downloaded file looks like HTML, not a ZIP dataset")
-
-          extract_dir = out_dir / "unzipped"
-          extract_dir.mkdir(exist_ok=True)
+          if not zipfile.is_zipfile(zip_path):
+              raise SystemExit("ERROR: File is not recognized as a ZIP archive")
 
           with zipfile.ZipFile(zip_path, "r") as zf:
               names = zf.namelist()
+              print(f"ZIP entry count: {len(names)}")
               if not names:
-                  raise SystemExit("ZIP is empty")
-              bad = zf.testzip()
-              if bad is not None:
-                  raise SystemExit(f"ZIP is corrupt at member: {bad}")
+                  raise SystemExit("ERROR: ZIP archive is empty")
 
-              print("\n=== ZIP CONTENT PREVIEW ===")
-              for name in names[:40]:
-                  print(name)
-              if len(names) > 40:
-                  print(f"... and {len(names) - 40} more files")
+              print("First 50 ZIP entries:")
+              for name in names[:50]:
+                  print(" -", name)
 
-              zf.extractall(extract_dir)
+              bad_member = zf.testzip()
+              if bad_member is not None:
+                  raise SystemExit(f"ERROR: Corrupt ZIP member detected: {bad_member}")
 
-          xml_files = sorted(extract_dir.rglob("*.xml"))
-          if not xml_files:
-              raise SystemExit("No XML files found after extraction")
+          print("ZIP validation passed.")
+          PY
 
-          print(f"\nFound {len(xml_files)} XML files")
-          print("First few XML files:")
-          for p in xml_files[:10]:
+          echo
+          echo "=== STEP 4: EXTRACT ZIP ==="
+          mkdir -p unzipped
+
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+
+          zip_path = Path("lvbag-extract-nl.zip")
+          out_dir = Path("unzipped")
+
+          with zipfile.ZipFile(zip_path, "r") as zf:
+              zf.extractall(out_dir)
+
+          print("Extraction complete.")
+          PY
+
+          echo
+          echo "=== STEP 5: EXTRACTED FILE SUMMARY ==="
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("unzipped")
+          files = [p for p in root.rglob("*") if p.is_file()]
+          print(f"Total extracted files: {len(files)}")
+
+          if not files:
+              raise SystemExit("ERROR: No files found after extraction")
+
+          print("First 100 extracted files:")
+          for p in files[:100]:
+              try:
+                  size = p.stat().st_size
+              except Exception:
+                  size = -1
+              print(f" - {p} ({size} bytes)")
+          PY
+
+          echo
+          echo "=== STEP 6: FIND CANDIDATE XML FILES ==="
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("unzipped")
+          xml_files = sorted(root.rglob("*.xml"))
+          gml_files = sorted(root.rglob("*.gml"))
+
+          print(f"XML files found: {len(xml_files)}")
+          print(f"GML files found: {len(gml_files)}")
+
+          candidates = xml_files if xml_files else gml_files
+
+          if not candidates:
+              print("ERROR: No XML or GML files found in extracted dataset")
+              raise SystemExit(1)
+
+          print("First 50 candidate files:")
+          for p in candidates[:50]:
               print(" -", p)
+          PY
+
+          echo
+          echo "=== STEP 7: PARSE DATASET AND PRINT PREVIEW ==="
+          python3 - <<'PY'
+          import random
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          ROOT = Path("unzipped")
+          XML_FILES = sorted(ROOT.rglob("*.xml"))
+          GML_FILES = sorted(ROOT.rglob("*.gml"))
+
+          CANDIDATES = XML_FILES if XML_FILES else GML_FILES
+
+          if not CANDIDATES:
+              raise SystemExit("ERROR: No XML/GML files available for parsing")
+
+          print(f"Using {len(CANDIDATES)} candidate files for parsing")
 
           def strip_ns(tag: str) -> str:
-              return tag.split("}", 1)[-1] if "}" in tag else tag
+              if "}" in tag:
+                  return tag.split("}", 1)[1]
+              return tag
 
-          def first_text(elem, wanted_local_names):
+          def normalize_text(value):
+              if value is None:
+                  return None
+              value = str(value).strip()
+              return value if value else None
+
+          def find_first_text(elem, wanted_names):
+              wanted = {x.lower() for x in wanted_names}
               for sub in elem.iter():
-                  if strip_ns(sub.tag) in wanted_local_names:
-                      text = (sub.text or "").strip()
+                  local = strip_ns(sub.tag).lower()
+                  if local in wanted:
+                      text = normalize_text(sub.text)
                       if text:
                           return text
               return None
 
-          def iter_address_like_records(xml_path):
-              try:
-                  tree = ET.parse(xml_path)
-                  root = tree.getroot()
-              except Exception:
-                  return
+          def record_from_elem(elem):
+              postcode = find_first_text(elem, [
+                  "postcode",
+              ])
+              huisnummer = find_first_text(elem, [
+                  "huisnummer",
+              ])
+              straat = find_first_text(elem, [
+                  "openbareruimtenaam",
+                  "straatnaam",
+                  "naam",
+              ])
+              woonplaats = find_first_text(elem, [
+                  "woonplaatsnaam",
+              ])
+              toevoeging = find_first_text(elem, [
+                  "huisletter",
+                  "huisnummertoevoeging",
+                  "toevoeging",
+              ])
 
-              for elem in root.iter():
-                  local = strip_ns(elem.tag).lower()
-                  if local in {
-                      "nummeraanduiding",
-                      "adresseerbaarobject",
-                      "verblijfsobject",
-                      "ligplaats",
-                      "standplaats",
-                  }:
-                      postcode = first_text(elem, {"postcode"})
-                      huisnummer = first_text(elem, {"huisnummer"})
-                      straat = first_text(elem, {"openbareruimtenaam", "straatnaam", "naam"})
-                      woonplaats = first_text(elem, {"woonplaatsnaam"})
+              if not postcode or not huisnummer:
+                  return None
 
-                      if postcode and huisnummer:
-                          yield {
-                              "straat": straat,
-                              "huisnummer": huisnummer,
-                              "postcode": postcode,
-                              "woonplaats": woonplaats,
-                              "source": str(xml_path),
-                          }
+              return {
+                  "straat": straat or "?",
+                  "huisnummer": huisnummer,
+                  "toevoeging": toevoeging or "",
+                  "postcode": postcode,
+                  "woonplaats": woonplaats or "?",
+              }
+
+          target_tags = {
+              "nummeraanduiding",
+              "adresseerbaarobject",
+              "verblijfsobject",
+              "ligplaats",
+              "standplaats",
+          }
 
           preview = []
-          sample_pool = []
+          reservoir = []
+          parsed_files = 0
+          parse_errors = 0
+          matching_elements = 0
 
-          for xml_file in xml_files:
-              for rec in iter_address_like_records(xml_file):
-                  if len(preview) < 10:
-                      preview.append(rec)
-                  if len(sample_pool) < 500:
-                      sample_pool.append(rec)
-                  if len(preview) >= 10 and len(sample_pool) >= 500:
-                      break
-              if len(preview) >= 10 and len(sample_pool) >= 500:
+          # Try full-tree parse first; if a file fails, continue.
+          for file_path in CANDIDATES:
+              parsed_files += 1
+              try:
+                  tree = ET.parse(file_path)
+                  root = tree.getroot()
+              except Exception as e:
+                  parse_errors += 1
+                  print(f"WARNING: failed to parse {file_path}: {e}")
+                  continue
+
+              file_matches = 0
+              for elem in root.iter():
+                  local = strip_ns(elem.tag).lower()
+                  if local in target_tags:
+                      file_matches += 1
+                      rec = record_from_elem(elem)
+                      if rec is not None:
+                          matching_elements += 1
+                          if len(preview) < 20:
+                              preview.append(rec)
+                          if len(reservoir) < 2000:
+                              reservoir.append(rec)
+                          else:
+                              # reservoir sampling fallback
+                              idx = random.randint(0, matching_elements - 1)
+                              if idx < len(reservoir):
+                                  reservoir[idx] = rec
+
+              if file_matches > 0:
+                  print(f"Parsed candidate records from {file_path}: {file_matches}")
+
+              # Stop early once we have enough useful records
+              if len(preview) >= 10 and len(reservoir) >= 200:
                   break
 
-          if not preview:
-              raise SystemExit("Could not parse any postcode/huisnummer records from the extract")
+          print()
+          print("=== PARSE SUMMARY ===")
+          print(f"Files considered: {len(CANDIDATES)}")
+          print(f"Files attempted: {parsed_files}")
+          print(f"Files with parse errors: {parse_errors}")
+          print(f"Matching address-like elements: {matching_elements}")
+          print(f"Preview records collected: {len(preview)}")
+          print(f"Reservoir records collected: {len(reservoir)}")
 
-          print("\n=== DATA PREVIEW (first parsed addresses) ===")
-          for i, rec in enumerate(preview, 1):
-              print(
-                  f"{i:02d} | "
-                  f"{rec.get('straat') or '?'} | "
-                  f"{rec['huisnummer']} | "
-                  f"{rec['postcode']} | "
-                  f"{rec.get('woonplaats') or '?'}"
+          if not preview:
+              raise SystemExit(
+                  "ERROR: Could not extract any address preview rows with postcode and huisnummer"
               )
 
-          print("\n=== RANDOM SAMPLE OF 10 ADDRESSES ===")
-          chosen = random.sample(sample_pool, min(10, len(sample_pool)))
-          for i, rec in enumerate(chosen, 1):
+          print()
+          print("=== DATA PREVIEW (FIRST PARSED ROWS) ===")
+          for i, rec in enumerate(preview[:10], 1):
+              suffix = f" {rec['toevoeging']}" if rec["toevoeging"] else ""
               print(
                   f"{i:02d} | "
-                  f"{rec.get('straat') or '?'} | "
-                  f"{rec['huisnummer']} | "
+                  f"{rec['straat']} | "
+                  f"{rec['huisnummer']}{suffix} | "
                   f"{rec['postcode']} | "
-                  f"{rec.get('woonplaats') or '?'}"
+                  f"{rec['woonplaats']}"
+              )
+
+          print()
+          print("=== RANDOM SAMPLE OF ADDRESSES ===")
+          sample_count = min(10, len(reservoir))
+          chosen = random.sample(reservoir, sample_count)
+          for i, rec in enumerate(chosen, 1):
+              suffix = f" {rec['toevoeging']}" if rec["toevoeging"] else ""
+              print(
+                  f"{i:02d} | "
+                  f"{rec['straat']} | "
+                  f"{rec['huisnummer']}{suffix} | "
+                  f"{rec['postcode']} | "
+                  f"{rec['woonplaats']}"
               )
           PY
+
+          echo
+          echo "=== STEP 8: FINAL DIRECTORY SNAPSHOT ==="
+          find . -maxdepth 3 -type f | sort | head -200 || true
+
+          echo
+          echo "=== WORKFLOW COMPLETED SUCCESSFULLY ==="
