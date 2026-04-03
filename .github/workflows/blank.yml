@@ -1,4 +1,4 @@
-name: Test NL address options (full verbose matrix)
+name: Test NL address options (GitHub API discovery, verbose matrix)
 
 on:
   workflow_dispatch:
@@ -11,10 +11,11 @@ permissions:
 jobs:
   test-nl-address-options:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     env:
       PYTHONUNBUFFERED: "1"
       BAG_API_KEY: ${{ secrets.BAG_API_KEY }}
+      GITHUB_TOKEN: ${{ github.token }}
 
     steps:
       - name: Set up Python
@@ -29,7 +30,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install zstandard
 
-      - name: Run full verbose probe matrix
+      - name: Run full verbose probe matrix with GitHub discovery
         shell: bash
         run: |
           set -euo pipefail
@@ -54,8 +55,9 @@ jobs:
               zstd = None
 
           TIMEOUT = 45
-          USER_AGENT = "nl-address-options-matrix/4.0 (GitHub Actions)"
+          USER_AGENT = "nl-address-options-matrix/5.0 (GitHub Actions)"
           BAG_API_KEY = os.getenv("BAG_API_KEY", "").strip()
+          GH_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 
           RESULTS = []
           ATTEMPTS = []
@@ -136,6 +138,16 @@ jobs:
                       "duration_ms": int((time.time() - started) * 1000),
                       "error": f"{type(e).__name__}: {e}",
                   }
+
+
+          def github_api_json(url):
+              headers = {
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": USER_AGENT,
+              }
+              if GH_TOKEN:
+                  headers["Authorization"] = f"Bearer {GH_TOKEN}"
+              return request_url(url, headers=headers)
 
 
           def try_json(text):
@@ -267,6 +279,17 @@ jobs:
               return base
 
 
+          def artifact_ok_from_attempt(attempt):
+              analysis = attempt["analysis"]
+              ca = analysis.get("container_analysis", {})
+              return (
+                  attempt["status"] in (200, 206)
+                  and not analysis.get("looks_html", False)
+                  and isinstance(ca, dict)
+                  and ca.get("ok", False)
+              )
+
+
           def add_result(key, category, target, verdict, notes, status=None, duration_ms=None, details=None):
               RESULTS.append({
                   "key": key,
@@ -280,7 +303,7 @@ jobs:
               })
 
 
-          def add_attempt(dataset_key, url, response, analysis=None):
+          def add_attempt(dataset_key, url, response, analysis=None, source="manual"):
               ATTEMPTS.append({
                   "dataset_key": dataset_key,
                   "url": url,
@@ -288,6 +311,7 @@ jobs:
                   "duration_ms": response.get("duration_ms"),
                   "final_url": response.get("final_url"),
                   "error": response.get("error"),
+                  "source": source,
                   "analysis": analysis or {},
               })
 
@@ -301,49 +325,201 @@ jobs:
               )
 
 
+          def dedupe_urls(urls):
+              out = []
+              seen = set()
+              for u in urls:
+                  if u and u not in seen:
+                      seen.add(u)
+                      out.append(u)
+              return out
+
+
+          def github_contents_recursive(owner, repo, path="", max_dirs=30, max_files=200):
+              queue = [path]
+              seen_dirs = set()
+              files = []
+              dirs_processed = 0
+
+              while queue and dirs_processed < max_dirs and len(files) < max_files:
+                  current = queue.pop(0)
+                  if current in seen_dirs:
+                      continue
+                  seen_dirs.add(current)
+                  dirs_processed += 1
+
+                  if current:
+                      url = f"https://api.github.com/repos/{owner}/{repo}/contents/{urllib.parse.quote(current)}"
+                  else:
+                      url = f"https://api.github.com/repos/{owner}/{repo}/contents"
+
+                  res = github_api_json(url)
+                  parsed = try_json(res["text"])
+                  if res["status"] != 200 or not isinstance(parsed, list):
+                      continue
+
+                  for item in parsed:
+                      if not isinstance(item, dict):
+                          continue
+                      item_type = item.get("type")
+                      item_path = item.get("path", "")
+                      name = item.get("name", "")
+                      if item_type == "file":
+                          files.append(item)
+                          if len(files) >= max_files:
+                              break
+                      elif item_type == "dir":
+                          blob = f"{name} {item_path}".lower()
+                          if any(x in blob for x in ["data", "csv", "dist", "export", "release", "releases", "downloads", "download"]):
+                              queue.append(item_path)
+
+              return files
+
+
+          def discover_github_repo_artifacts(owner, repo):
+              discovered_urls = []
+              discovery = {
+                  "repo": f"{owner}/{repo}",
+                  "repo_status": None,
+                  "contents_status": None,
+                  "releases_status": None,
+                  "tags_status": None,
+                  "default_branch": None,
+                  "root_entries": [],
+                  "release_assets": [],
+                  "tag_names": [],
+                  "recursive_candidate_files": [],
+              }
+
+              repo_api = f"https://api.github.com/repos/{owner}/{repo}"
+              contents_api = f"https://api.github.com/repos/{owner}/{repo}/contents"
+              releases_api = f"https://api.github.com/repos/{owner}/{repo}/releases"
+              tags_api = f"https://api.github.com/repos/{owner}/{repo}/tags"
+
+              repo_res = github_api_json(repo_api)
+              repo_json = try_json(repo_res["text"])
+              discovery["repo_status"] = repo_res["status"]
+              if isinstance(repo_json, dict):
+                  discovery["default_branch"] = repo_json.get("default_branch")
+
+              root_res = github_api_json(contents_api)
+              root_json = try_json(root_res["text"])
+              discovery["contents_status"] = root_res["status"]
+
+              releases_res = github_api_json(releases_api)
+              releases_json = try_json(releases_res["text"])
+              discovery["releases_status"] = releases_res["status"]
+
+              tags_res = github_api_json(tags_api)
+              tags_json = try_json(tags_res["text"])
+              discovery["tags_status"] = tags_res["status"]
+
+              good_exts = [".csv", ".zip", ".gz", ".zst", ".txt", ".tsv", ".json"]
+
+              if isinstance(root_json, list):
+                  for item in root_json:
+                      if not isinstance(item, dict):
+                          continue
+                      row = {
+                          "name": item.get("name"),
+                          "path": item.get("path"),
+                          "type": item.get("type"),
+                          "download_url": item.get("download_url"),
+                      }
+                      discovery["root_entries"].append(row)
+
+                      name = str(item.get("name", "")).lower()
+                      if item.get("type") == "file" and any(name.endswith(ext) for ext in good_exts):
+                          if item.get("download_url"):
+                              discovered_urls.append(item["download_url"])
+
+              if isinstance(releases_json, list):
+                  for rel in releases_json:
+                      if not isinstance(rel, dict):
+                          continue
+                      assets = rel.get("assets", [])
+                      for asset in assets:
+                          if not isinstance(asset, dict):
+                              continue
+                          row = {
+                              "name": asset.get("name"),
+                              "size": asset.get("size"),
+                              "content_type": asset.get("content_type"),
+                              "browser_download_url": asset.get("browser_download_url"),
+                          }
+                          discovery["release_assets"].append(row)
+                          name = str(asset.get("name", "")).lower()
+                          url = asset.get("browser_download_url")
+                          if url and any(name.endswith(ext) for ext in good_exts):
+                              discovered_urls.append(url)
+
+              if isinstance(tags_json, list):
+                  discovery["tag_names"] = [t.get("name") for t in tags_json[:20] if isinstance(t, dict)]
+
+              files = github_contents_recursive(owner, repo)
+              for item in files:
+                  name = str(item.get("name", "")).lower()
+                  row = {
+                      "name": item.get("name"),
+                      "path": item.get("path"),
+                      "download_url": item.get("download_url"),
+                      "size": item.get("size"),
+                  }
+                  if any(name.endswith(ext) for ext in good_exts):
+                      discovery["recursive_candidate_files"].append(row)
+                      if item.get("download_url"):
+                          discovered_urls.append(item["download_url"])
+
+              return dedupe_urls(discovered_urls), discovery
+
+
           def test_candidate_urls(dataset_key, urls):
               log(f"=== DATASET {dataset_key} ===")
               attempts = []
               usable_attempts = []
 
-              for idx, url in enumerate(urls, start=1):
-                  log(f"[{dataset_key}] Attempt {idx}/{len(urls)}: {url}")
+              for idx, entry in enumerate(urls, start=1):
+                  if isinstance(entry, dict):
+                      url = entry["url"]
+                      source = entry.get("source", "manual")
+                  else:
+                      url = entry
+                      source = "manual"
+
+                  log(f"[{dataset_key}] Attempt {idx}/{len(urls)} ({source}): {url}")
                   res = partial_get(url)
                   analysis = analyze_artifact(res["body"], res["headers"])
-                  add_attempt(dataset_key, url, res, analysis)
-                  attempts.append({
+                  add_attempt(dataset_key, url, res, analysis, source=source)
+
+                  attempt = {
                       "url": url,
+                      "source": source,
                       "status": res["status"],
                       "duration_ms": res["duration_ms"],
                       "final_url": res["final_url"],
                       "error": res["error"],
                       "analysis": analysis,
-                  })
+                  }
+                  attempts.append(attempt)
 
                   log(
                       f"[{dataset_key}] -> status={res['status']} duration_ms={res['duration_ms']} "
                       f"zip={analysis.get('is_zip')} gzip={analysis.get('is_gzip')} zstd={analysis.get('is_zstd')} "
                       f"html={analysis.get('looks_html')} csvish={analysis.get('looks_csvish')}"
                   )
-
+                  log(f"[{dataset_key}] -> preview={analysis.get('preview', '')[:300]}")
                   ca = analysis.get("container_analysis", {})
                   if isinstance(ca, dict):
-                      log(f"[{dataset_key}] -> container_analysis={json.dumps(ca)[:1200]}")
+                      log(f"[{dataset_key}] -> container_analysis={json.dumps(ca)[:1500]}")
 
-                  artifact_ok = (
-                      res["status"] in (200, 206)
-                      and not analysis.get("looks_html", False)
-                      and analysis.get("container_analysis", {}).get("ok", False)
-                  )
-
-                  if artifact_ok:
-                      usable_attempts.append(attempts[-1])
+                  if artifact_ok_from_attempt(attempt):
+                      usable_attempts.append(attempt)
 
               if usable_attempts:
                   add_result(
                       dataset_key,
                       "dataset",
-                      urls[0],
+                      urls[0]["url"] if isinstance(urls[0], dict) else urls[0],
                       "pass",
                       f"Verified {len(usable_attempts)} usable artifact candidate(s).",
                       usable_attempts[0]["status"],
@@ -358,7 +534,7 @@ jobs:
                   add_result(
                       dataset_key,
                       "dataset",
-                      urls[0],
+                      urls[0]["url"] if isinstance(urls[0], dict) else urls[0],
                       "warn",
                       "No usable artifact verified from candidate URLs.",
                       attempts[0]["status"] if attempts else None,
@@ -630,16 +806,45 @@ jobs:
               return data_url
 
 
+          def build_github_dataset_urls(owner, repo, manual_urls):
+              discovered_urls, discovery = discover_github_repo_artifacts(owner, repo)
+
+              add_result(
+                  f"github_discovery_{owner}_{repo}",
+                  "dataset-meta",
+                  f"https://api.github.com/repos/{owner}/{repo}",
+                  "pass",
+                  "GitHub discovery completed.",
+                  discovery.get("repo_status"),
+                  None,
+                  discovery,
+              )
+
+              urls = []
+              for u in manual_urls:
+                  urls.append({"url": u, "source": "manual"})
+              for u in discovered_urls:
+                  urls.append({"url": u, "source": "github_api_discovered"})
+              return urls
+
+
           def test_all_datasets():
               openaddresses_data_url = discover_openaddresses_data_url()
 
-              datasets = {
-                  "openaddresses_nl": [u for u in [
-                      openaddresses_data_url,
-                      "https://results.openaddresses.io/latest/run/nl/countrywide/addresses.csv.zip",
-                  ] if u],
+              openaddresses_urls = []
+              if openaddresses_data_url:
+                  openaddresses_urls.append({"url": openaddresses_data_url, "source": "openaddresses_config"})
+              openaddresses_urls.append({"url": "https://results.openaddresses.io/latest/run/nl/countrywide/addresses.csv.zip", "source": "openaddresses_results"})
 
-                  "github_mevdschee_postcodes_nl_geo": [
+              test_candidate_urls("openaddresses_nl", dedupe_urls([u["url"] for u in openaddresses_urls]))
+              # rebuild with source tags preserved
+              openaddresses_urls = [{"url": u["url"], "source": u["source"]} for u in openaddresses_urls]
+              test_candidate_urls("openaddresses_nl_with_sources", openaddresses_urls)
+
+              mevdschee_urls = build_github_dataset_urls(
+                  "mevdschee",
+                  "postcodes-nl-geo",
+                  [
                       "https://github.com/mevdschee/postcodes-nl-geo/releases/latest/download/postcodes_nl.csv.gz",
                       "https://github.com/mevdschee/postcodes-nl-geo/releases/latest/download/postcodes_nl.txt.gz",
                       "https://raw.githubusercontent.com/mevdschee/postcodes-nl-geo/master/postcodes_nl.csv",
@@ -647,15 +852,25 @@ jobs:
                       "https://raw.githubusercontent.com/mevdschee/postcodes-nl-geo/main/postcodes_nl.csv",
                       "https://raw.githubusercontent.com/mevdschee/postcodes-nl-geo/main/postcodes_nl.txt",
                   ],
+              )
+              test_candidate_urls("github_mevdschee_postcodes_nl_geo", mevdschee_urls)
 
-                  "github_ljpc_nederlandse_adressen_en_postcodes": [
+              ljpc_urls = build_github_dataset_urls(
+                  "LJPc-solutions",
+                  "Nederlandse-adressen-en-postcodes",
+                  [
                       "https://github.com/LJPc-solutions/Nederlandse-adressen-en-postcodes/releases/latest/download/adressen.csv.zst",
                       "https://github.com/LJPc-solutions/Nederlandse-adressen-en-postcodes/releases/latest/download/postcodes.csv.zst",
                       "https://github.com/LJPc-solutions/Nederlandse-adressen-en-postcodes/releases/latest/download/nederlandse-adressen.csv.zst",
                       "https://github.com/LJPc-solutions/Nederlandse-adressen-en-postcodes/releases/latest/download/nederlandse-postcodes.csv.zst",
                   ],
+              )
+              test_candidate_urls("github_ljpc_nederlandse_adressen_en_postcodes", ljpc_urls)
 
-                  "github_jorritb_dutch_postal_codes": [
+              jorritb_urls = build_github_dataset_urls(
+                  "jorritb",
+                  "dutch-postal-codes",
+                  [
                       "https://raw.githubusercontent.com/jorritb/dutch-postal-codes/master/data.csv",
                       "https://raw.githubusercontent.com/jorritb/dutch-postal-codes/main/data.csv",
                       "https://raw.githubusercontent.com/jorritb/dutch-postal-codes/master/postcodes.csv",
@@ -663,10 +878,8 @@ jobs:
                       "https://raw.githubusercontent.com/jorritb/dutch-postal-codes/master/dutch-postal-codes.csv",
                       "https://raw.githubusercontent.com/jorritb/dutch-postal-codes/main/dutch-postal-codes.csv",
                   ],
-              }
-
-              for dataset_key, urls in datasets.items():
-                  test_candidate_urls(dataset_key, urls)
+              )
+              test_candidate_urls("github_jorritb_dutch_postal_codes", jorritb_urls)
 
 
           def render_summary():
@@ -682,6 +895,7 @@ jobs:
               lines.append(f"- BAG API key present: `{bool(BAG_API_KEY)}`")
               lines.append(f"- Results: pass={passes}, warn={warns}, fail={fails}, skip={skips}")
               lines.append("")
+
               lines.append("## Result summary")
               lines.append("")
               lines.append("| Key | Category | Verdict | Status | Notes |")
@@ -694,14 +908,15 @@ jobs:
               lines.append("")
               lines.append("## Attempt matrix")
               lines.append("")
-              lines.append("| Dataset | URL | Status | Duration ms | Error |")
-              lines.append("|---|---|---:|---:|---|")
+              lines.append("| Dataset | Source | URL | Status | Duration ms | Error |")
+              lines.append("|---|---|---|---:|---:|---|")
               for a in ATTEMPTS:
                   st = "" if a["status"] is None else str(a["status"])
                   dur = "" if a["duration_ms"] is None else str(a["duration_ms"])
                   err = "" if not a["error"] else str(a["error"]).replace("|", "\\|")
+                  src = a.get("source", "")
                   url = a["url"].replace("|", "%7C")
-                  lines.append(f"| `{a['dataset_key']}` | `{url}` | {st} | {dur} | {err} |")
+                  lines.append(f"| `{a['dataset_key']}` | `{src}` | `{url}` | {st} | {dur} | {err} |")
 
               return "\n".join(lines) + "\n"
 
