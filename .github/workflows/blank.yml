@@ -1,4 +1,4 @@
-name: Test NL address options (GitHub API discovery, verbose matrix)
+name: Random Dutch house from LJPc dataset
 
 on:
   workflow_dispatch:
@@ -9,13 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  test-nl-address-options:
+  random-nl-house:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
-    env:
-      PYTHONUNBUFFERED: "1"
-      BAG_API_KEY: ${{ secrets.BAG_API_KEY }}
-      GITHUB_TOKEN: ${{ github.token }}
+    timeout-minutes: 20
 
     steps:
       - name: Set up Python
@@ -23,972 +19,116 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install optional inspectors
+      - name: Install dependency
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install zstandard
 
-      - name: Run full verbose probe matrix with GitHub discovery
+      - name: Pick a random Dutch house
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > check_nl_address_options.py <<'PY'
+          cat > random_nl_house.py <<'PY'
           import csv
-          import gzip
           import io
           import json
-          import os
-          import ssl
-          import sys
-          import time
-          import zipfile
-          import urllib.error
-          import urllib.parse
+          import random
           import urllib.request
+          import zstandard as zstd
 
-          try:
-              import zstandard as zstd
-          except Exception:
-              zstd = None
+          URL = "https://raw.githubusercontent.com/LJPc-solutions/Nederlandse-adressen-en-postcodes/main/Nederland.csv.zst"
+          USER_AGENT = "random-nl-house-github-action/1.0"
 
-          TIMEOUT = 45
-          USER_AGENT = "nl-address-options-matrix/5.0 (GitHub Actions)"
-          BAG_API_KEY = os.getenv("BAG_API_KEY", "").strip()
-          GH_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
-
-          RESULTS = []
-          ATTEMPTS = []
-
-
-          def now_iso():
-              return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-          def make_opener():
-              ctx = ssl.create_default_context()
-              return urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
-
-
-          OPENER = make_opener()
-
-
-          def log(msg):
-              print(msg, flush=True)
-
-
-          def safe_decode(data):
-              for enc in ("utf-8", "utf-8-sig", "latin-1"):
-                  try:
-                      return data.decode(enc)
-                  except Exception:
-                      pass
-              return data.decode("utf-8", errors="replace")
-
-
-          def request_url(url, method="GET", headers=None, body=True):
-              h = {
-                  "User-Agent": USER_AGENT,
-                  "Accept": "*/*",
-              }
-              if headers:
-                  h.update(headers)
-
-              req = urllib.request.Request(url=url, method=method, headers=h)
-              started = time.time()
-
-              try:
-                  with OPENER.open(req, timeout=TIMEOUT) as resp:
-                      payload = resp.read() if body else b""
-                      return {
-                          "ok": True,
-                          "status": getattr(resp, "status", 200),
-                          "final_url": resp.geturl(),
-                          "headers": dict(resp.headers.items()),
-                          "body": payload,
-                          "text": safe_decode(payload) if body else "",
-                          "duration_ms": int((time.time() - started) * 1000),
-                          "error": None,
-                      }
-              except urllib.error.HTTPError as e:
-                  try:
-                      payload = e.read()
-                  except Exception:
-                      payload = b""
-                  return {
-                      "ok": False,
-                      "status": e.code,
-                      "final_url": url,
-                      "headers": dict(getattr(e, "headers", {}).items()) if getattr(e, "headers", None) else {},
-                      "body": payload,
-                      "text": safe_decode(payload),
-                      "duration_ms": int((time.time() - started) * 1000),
-                      "error": f"HTTPError {e.code}",
-                  }
-              except Exception as e:
-                  return {
-                      "ok": False,
-                      "status": None,
-                      "final_url": url,
-                      "headers": {},
-                      "body": b"",
-                      "text": "",
-                      "duration_ms": int((time.time() - started) * 1000),
-                      "error": f"{type(e).__name__}: {e}",
-                  }
-
-
-          def github_api_json(url):
-              headers = {
-                  "Accept": "application/vnd.github+json",
-                  "User-Agent": USER_AGENT,
-              }
-              if GH_TOKEN:
-                  headers["Authorization"] = f"Bearer {GH_TOKEN}"
-              return request_url(url, headers=headers)
-
-
-          def try_json(text):
-              try:
-                  return json.loads(text)
-              except Exception:
-                  return None
-
-
-          def looks_like_html(text):
-              t = text[:2000].lower()
-              return "<html" in t or "<!doctype html" in t
-
-
-          def sniff_bytes(body, headers=None):
-              text_preview = safe_decode(body[:2000])
-              ct = ""
-              if headers:
-                  for k, v in headers.items():
-                      if k.lower() == "content-type":
-                          ct = v
-                          break
-
-              return {
-                  "size": len(body),
-                  "content_type": ct,
-                  "is_zip": body.startswith(b"PK\x03\x04") or body.startswith(b"PK\x05\x06") or body.startswith(b"PK\x07\x08"),
-                  "is_gzip": body.startswith(b"\x1f\x8b"),
-                  "is_zstd": body.startswith(b"\x28\xb5\x2f\xfd"),
-                  "looks_json": text_preview.lstrip().startswith("{") or text_preview.lstrip().startswith("["),
-                  "looks_html": looks_like_html(text_preview),
-                  "looks_csvish": any(x in text_preview for x in [",", ";", "\t", "|"]),
-                  "preview": text_preview[:400].replace("\n", "\\n"),
-              }
-
-
-          def parse_csv_text(text):
-              sample = text[:50000]
-              for delim in [",", ";", "\t", "|"]:
-                  try:
-                      rows = list(csv.reader(io.StringIO(sample), delimiter=delim))
-                      if rows and len(rows[0]) >= 2:
-                          header = [c.strip() for c in rows[0]]
-                          header_l = [c.lower() for c in header]
-                          return {
-                              "ok": True,
-                              "delimiter": delim,
-                              "header": header[:50],
-                              "row_count_sample": len(rows),
-                              "has_postcode_field": any(k in header_l for k in ["postcode", "postal_code", "postalcode", "pc4", "pc6"]),
-                              "has_housenumber_field": any(k in header_l for k in ["huisnummer", "house_number", "housenumber", "number"]),
-                              "has_addressish_field": any(k in header_l for k in [
-                                  "straat", "street", "woonplaats", "city", "plaats",
-                                  "gemeente", "latitude", "longitude", "lat", "lon", "x", "y"
-                              ]),
-                          }
-                  except Exception:
-                      pass
-              return {"ok": False, "reason": "Could not parse CSV-like content from sample."}
-
-
-          def inspect_zip_bytes(body):
-              try:
-                  zf = zipfile.ZipFile(io.BytesIO(body))
-                  names = zf.namelist()
-                  out = {
-                      "ok": True,
-                      "entry_count": len(names),
-                      "entries": names[:30],
-                  }
-
-                  candidate = None
-                  for n in names:
-                      nl = n.lower()
-                      if nl.endswith(".csv") or nl.endswith(".txt"):
-                          candidate = n
-                          break
-                  if candidate is None and names:
-                      candidate = names[0]
-
-                  if candidate:
-                      with zf.open(candidate) as f:
-                          sample = f.read(50000)
-                      out["sample_entry"] = candidate
-                      out["sample_entry_analysis"] = parse_csv_text(safe_decode(sample))
-                  return out
-              except Exception as e:
-                  return {"ok": False, "reason": f"Zip inspection failed: {type(e).__name__}: {e}"}
-
-
-          def inspect_gzip_bytes(body):
-              try:
-                  sample = gzip.decompress(body)[:50000]
-                  return {
-                      "ok": True,
-                      "sample_analysis": parse_csv_text(safe_decode(sample)),
-                  }
-              except Exception as e:
-                  return {"ok": False, "reason": f"Gzip inspection failed: {type(e).__name__}: {e}"}
-
-
-          def inspect_zstd_bytes(body):
-              if zstd is None:
-                  return {"ok": False, "reason": "zstandard module not installed."}
-              try:
+          def random_address_from_zstd_csv(url: str) -> dict:
+              req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+              with urllib.request.urlopen(req, timeout=120) as resp:
                   dctx = zstd.ZstdDecompressor()
-                  with dctx.stream_reader(io.BytesIO(body)) as reader:
-                      sample = reader.read(50000)
-                  return {
-                      "ok": True,
-                      "sample_analysis": parse_csv_text(safe_decode(sample)),
-                  }
-              except Exception as e:
-                  return {"ok": False, "reason": f"Zstd inspection failed: {type(e).__name__}: {e}"}
+                  with dctx.stream_reader(resp) as reader:
+                      text_stream = io.TextIOWrapper(reader, encoding="utf-8", newline="")
+                      csv_reader = csv.DictReader(text_stream, delimiter=";")
 
+                      chosen = None
+                      count = 0
 
-          def analyze_artifact(body, headers=None):
-              base = sniff_bytes(body, headers=headers)
-              if base["is_zip"]:
-                  base["container_analysis"] = inspect_zip_bytes(body)
-              elif base["is_gzip"]:
-                  base["container_analysis"] = inspect_gzip_bytes(body)
-              elif base["is_zstd"]:
-                  base["container_analysis"] = inspect_zstd_bytes(body)
-              elif not base["looks_html"]:
-                  base["container_analysis"] = parse_csv_text(safe_decode(body[:50000]))
-              else:
-                  base["container_analysis"] = {"ok": False, "reason": "Looks like HTML, not an artifact."}
-              return base
-
-
-          def artifact_ok_from_attempt(attempt):
-              analysis = attempt["analysis"]
-              ca = analysis.get("container_analysis", {})
-              return (
-                  attempt["status"] in (200, 206)
-                  and not analysis.get("looks_html", False)
-                  and isinstance(ca, dict)
-                  and ca.get("ok", False)
-              )
-
-
-          def add_result(key, category, target, verdict, notes, status=None, duration_ms=None, details=None):
-              RESULTS.append({
-                  "key": key,
-                  "category": category,
-                  "target": target,
-                  "verdict": verdict,
-                  "status": status,
-                  "duration_ms": duration_ms,
-                  "notes": notes,
-                  "details": details or {},
-              })
-
-
-          def add_attempt(dataset_key, url, response, analysis=None, source="manual"):
-              ATTEMPTS.append({
-                  "dataset_key": dataset_key,
-                  "url": url,
-                  "status": response.get("status"),
-                  "duration_ms": response.get("duration_ms"),
-                  "final_url": response.get("final_url"),
-                  "error": response.get("error"),
-                  "source": source,
-                  "analysis": analysis or {},
-              })
-
-
-          def partial_get(url, max_bytes=2000000):
-              return request_url(
-                  url,
-                  method="GET",
-                  headers={"Range": f"bytes=0-{max_bytes-1}"},
-                  body=True,
-              )
-
-
-          def dedupe_urls(urls):
-              out = []
-              seen = set()
-              for u in urls:
-                  if u and u not in seen:
-                      seen.add(u)
-                      out.append(u)
-              return out
-
-
-          def github_contents_recursive(owner, repo, path="", max_dirs=30, max_files=200):
-              queue = [path]
-              seen_dirs = set()
-              files = []
-              dirs_processed = 0
-
-              while queue and dirs_processed < max_dirs and len(files) < max_files:
-                  current = queue.pop(0)
-                  if current in seen_dirs:
-                      continue
-                  seen_dirs.add(current)
-                  dirs_processed += 1
-
-                  if current:
-                      url = f"https://api.github.com/repos/{owner}/{repo}/contents/{urllib.parse.quote(current)}"
-                  else:
-                      url = f"https://api.github.com/repos/{owner}/{repo}/contents"
-
-                  res = github_api_json(url)
-                  parsed = try_json(res["text"])
-                  if res["status"] != 200 or not isinstance(parsed, list):
-                      continue
-
-                  for item in parsed:
-                      if not isinstance(item, dict):
-                          continue
-                      item_type = item.get("type")
-                      item_path = item.get("path", "")
-                      name = item.get("name", "")
-                      if item_type == "file":
-                          files.append(item)
-                          if len(files) >= max_files:
-                              break
-                      elif item_type == "dir":
-                          blob = f"{name} {item_path}".lower()
-                          if any(x in blob for x in ["data", "csv", "dist", "export", "release", "releases", "downloads", "download"]):
-                              queue.append(item_path)
-
-              return files
-
-
-          def discover_github_repo_artifacts(owner, repo):
-              discovered_urls = []
-              discovery = {
-                  "repo": f"{owner}/{repo}",
-                  "repo_status": None,
-                  "contents_status": None,
-                  "releases_status": None,
-                  "tags_status": None,
-                  "default_branch": None,
-                  "root_entries": [],
-                  "release_assets": [],
-                  "tag_names": [],
-                  "recursive_candidate_files": [],
-              }
-
-              repo_api = f"https://api.github.com/repos/{owner}/{repo}"
-              contents_api = f"https://api.github.com/repos/{owner}/{repo}/contents"
-              releases_api = f"https://api.github.com/repos/{owner}/{repo}/releases"
-              tags_api = f"https://api.github.com/repos/{owner}/{repo}/tags"
-
-              repo_res = github_api_json(repo_api)
-              repo_json = try_json(repo_res["text"])
-              discovery["repo_status"] = repo_res["status"]
-              if isinstance(repo_json, dict):
-                  discovery["default_branch"] = repo_json.get("default_branch")
-
-              root_res = github_api_json(contents_api)
-              root_json = try_json(root_res["text"])
-              discovery["contents_status"] = root_res["status"]
-
-              releases_res = github_api_json(releases_api)
-              releases_json = try_json(releases_res["text"])
-              discovery["releases_status"] = releases_res["status"]
-
-              tags_res = github_api_json(tags_api)
-              tags_json = try_json(tags_res["text"])
-              discovery["tags_status"] = tags_res["status"]
-
-              good_exts = [".csv", ".zip", ".gz", ".zst", ".txt", ".tsv", ".json"]
-
-              if isinstance(root_json, list):
-                  for item in root_json:
-                      if not isinstance(item, dict):
-                          continue
-                      row = {
-                          "name": item.get("name"),
-                          "path": item.get("path"),
-                          "type": item.get("type"),
-                          "download_url": item.get("download_url"),
-                      }
-                      discovery["root_entries"].append(row)
-
-                      name = str(item.get("name", "")).lower()
-                      if item.get("type") == "file" and any(name.endswith(ext) for ext in good_exts):
-                          if item.get("download_url"):
-                              discovered_urls.append(item["download_url"])
-
-              if isinstance(releases_json, list):
-                  for rel in releases_json:
-                      if not isinstance(rel, dict):
-                          continue
-                      assets = rel.get("assets", [])
-                      for asset in assets:
-                          if not isinstance(asset, dict):
+                      for row in csv_reader:
+                          if not row.get("postcode") or not row.get("huisnummer") or not row.get("straat"):
                               continue
-                          row = {
-                              "name": asset.get("name"),
-                              "size": asset.get("size"),
-                              "content_type": asset.get("content_type"),
-                              "browser_download_url": asset.get("browser_download_url"),
-                          }
-                          discovery["release_assets"].append(row)
-                          name = str(asset.get("name", "")).lower()
-                          url = asset.get("browser_download_url")
-                          if url and any(name.endswith(ext) for ext in good_exts):
-                              discovered_urls.append(url)
 
-              if isinstance(tags_json, list):
-                  discovery["tag_names"] = [t.get("name") for t in tags_json[:20] if isinstance(t, dict)]
-
-              files = github_contents_recursive(owner, repo)
-              for item in files:
-                  name = str(item.get("name", "")).lower()
-                  row = {
-                      "name": item.get("name"),
-                      "path": item.get("path"),
-                      "download_url": item.get("download_url"),
-                      "size": item.get("size"),
-                  }
-                  if any(name.endswith(ext) for ext in good_exts):
-                      discovery["recursive_candidate_files"].append(row)
-                      if item.get("download_url"):
-                          discovered_urls.append(item["download_url"])
-
-              return dedupe_urls(discovered_urls), discovery
-
-
-          def test_candidate_urls(dataset_key, urls):
-              log(f"=== DATASET {dataset_key} ===")
-              attempts = []
-              usable_attempts = []
-
-              for idx, entry in enumerate(urls, start=1):
-                  if isinstance(entry, dict):
-                      url = entry["url"]
-                      source = entry.get("source", "manual")
-                  else:
-                      url = entry
-                      source = "manual"
-
-                  log(f"[{dataset_key}] Attempt {idx}/{len(urls)} ({source}): {url}")
-                  res = partial_get(url)
-                  analysis = analyze_artifact(res["body"], res["headers"])
-                  add_attempt(dataset_key, url, res, analysis, source=source)
-
-                  attempt = {
-                      "url": url,
-                      "source": source,
-                      "status": res["status"],
-                      "duration_ms": res["duration_ms"],
-                      "final_url": res["final_url"],
-                      "error": res["error"],
-                      "analysis": analysis,
-                  }
-                  attempts.append(attempt)
-
-                  log(
-                      f"[{dataset_key}] -> status={res['status']} duration_ms={res['duration_ms']} "
-                      f"zip={analysis.get('is_zip')} gzip={analysis.get('is_gzip')} zstd={analysis.get('is_zstd')} "
-                      f"html={analysis.get('looks_html')} csvish={analysis.get('looks_csvish')}"
-                  )
-                  log(f"[{dataset_key}] -> preview={analysis.get('preview', '')[:300]}")
-                  ca = analysis.get("container_analysis", {})
-                  if isinstance(ca, dict):
-                      log(f"[{dataset_key}] -> container_analysis={json.dumps(ca)[:1500]}")
-
-                  if artifact_ok_from_attempt(attempt):
-                      usable_attempts.append(attempt)
-
-              if usable_attempts:
-                  add_result(
-                      dataset_key,
-                      "dataset",
-                      urls[0]["url"] if isinstance(urls[0], dict) else urls[0],
-                      "pass",
-                      f"Verified {len(usable_attempts)} usable artifact candidate(s).",
-                      usable_attempts[0]["status"],
-                      usable_attempts[0]["duration_ms"],
-                      {
-                          "usable_attempt_count": len(usable_attempts),
-                          "usable_attempts": usable_attempts,
-                          "all_attempts": attempts,
-                      },
-                  )
-              else:
-                  add_result(
-                      dataset_key,
-                      "dataset",
-                      urls[0]["url"] if isinstance(urls[0], dict) else urls[0],
-                      "warn",
-                      "No usable artifact verified from candidate URLs.",
-                      attempts[0]["status"] if attempts else None,
-                      attempts[0]["duration_ms"] if attempts else None,
-                      {
-                          "usable_attempt_count": 0,
-                          "all_attempts": attempts,
-                      },
-                  )
-
-
-          def check_pdok_locatieserver():
-              url = "https://api.pdok.nl/bzk/locatieserver/search/v3_1/free?q=1012LG%201"
-              res = request_url(url)
-              parsed = try_json(res["text"])
-              good = False
-              details = {}
-
-              if isinstance(parsed, dict):
-                  response = parsed.get("response", {})
-                  docs = response.get("docs", []) if isinstance(response, dict) else []
-                  num_found = response.get("numFound") if isinstance(response, dict) else None
-                  first = docs[0] if isinstance(docs, list) and docs and isinstance(docs[0], dict) else {}
-                  good = (
-                      res["status"] == 200 and
-                      isinstance(num_found, int) and num_found > 0 and
-                      bool(first)
-                  )
-                  details = {
-                      "numFound": num_found,
-                      "first_doc_keys": sorted(list(first.keys()))[:40],
-                      "first_doc_preview": {k: first.get(k) for k in list(first.keys())[:10]},
-                  }
-
-              add_result(
-                  "pdok_locatieserver_free",
-                  "official-api",
-                  url,
-                  "pass" if good else "fail",
-                  "PDOK Locatieserver free returned real results." if good else "PDOK Locatieserver free did not return convincing results.",
-                  res["status"],
-                  res["duration_ms"],
-                  details or {"error": res["error"], "preview": res["text"][:500]},
-              )
-
-
-          def check_pdok_locatieserver_suggest():
-              url = "https://api.pdok.nl/bzk/locatieserver/search/v3_1/suggest?q=1012LG%201"
-              res = request_url(url)
-              parsed = try_json(res["text"])
-              good = False
-              details = {}
-
-              if isinstance(parsed, dict):
-                  response = parsed.get("response", {})
-                  docs = response.get("docs", []) if isinstance(response, dict) else []
-                  first = docs[0] if isinstance(docs, list) and docs and isinstance(docs[0], dict) else {}
-                  good = res["status"] == 200 and isinstance(docs, list) and len(docs) > 0
-                  details = {
-                      "doc_count": len(docs) if isinstance(docs, list) else None,
-                      "first_doc_preview": first,
-                  }
-
-              add_result(
-                  "pdok_locatieserver_suggest",
-                  "official-api",
-                  url,
-                  "pass" if good else "fail",
-                  "PDOK Locatieserver suggest returned real results." if good else "PDOK Locatieserver suggest returned no useful results.",
-                  res["status"],
-                  res["duration_ms"],
-                  details or {"error": res["error"], "preview": res["text"][:500]},
-              )
-
-
-          def check_pdok_bag_ogc():
-              collections_url = "https://api.pdok.nl/kadaster/bag/ogc/v2/collections"
-              res = request_url(collections_url, headers={"Accept": "application/json"})
-              parsed = try_json(res["text"])
-
-              if not (res["status"] == 200 and isinstance(parsed, dict)):
-                  add_result(
-                      "pdok_bag_ogc_collections",
-                      "official-api",
-                      collections_url,
-                      "fail",
-                      "BAG OGC collections endpoint failed.",
-                      res["status"],
-                      res["duration_ms"],
-                      {"error": res["error"], "preview": res["text"][:500]},
-                  )
-                  return
-
-              collections = parsed.get("collections", [])
-              good = isinstance(collections, list) and len(collections) > 0
-              add_result(
-                  "pdok_bag_ogc_collections",
-                  "official-api",
-                  collections_url,
-                  "pass" if good else "fail",
-                  "BAG OGC collections loaded." if good else "BAG OGC collections empty.",
-                  res["status"],
-                  res["duration_ms"],
-                  {
-                      "collection_count": len(collections) if isinstance(collections, list) else None,
-                      "sample_collection_ids": [c.get("id") for c in collections[:15] if isinstance(c, dict)],
-                  },
-              )
-
-              if not good:
-                  return
-
-              candidates = []
-              for c in collections:
-                  if not isinstance(c, dict):
-                      continue
-                  cid = str(c.get("id", ""))
-                  title = str(c.get("title", ""))
-                  blob = (cid + " " + title).lower()
-                  if any(x in blob for x in ["nummeraanduid", "adres", "verblijfsobject", "adresseer"]):
-                      candidates.append(cid)
-
-              if not candidates:
-                  candidates = [c.get("id") for c in collections if isinstance(c, dict) and c.get("id")][:5]
-
-              collection_attempts = []
-              chosen_good = None
-
-              for cid in candidates[:5]:
-                  items_url = f"https://api.pdok.nl/kadaster/bag/ogc/v2/collections/{urllib.parse.quote(cid)}/items?limit=5&f=json"
-                  items_res = request_url(items_url, headers={"Accept": "application/json, application/geo+json"})
-                  items_json = try_json(items_res["text"])
-                  features = items_json.get("features", []) if isinstance(items_json, dict) else []
-                  first = features[0] if isinstance(features, list) and features and isinstance(features[0], dict) else {}
-                  props = first.get("properties", {}) if isinstance(first, dict) else {}
-                  ok = items_res["status"] == 200 and isinstance(features, list) and len(features) > 0
-                  collection_attempts.append({
-                      "collection": cid,
-                      "status": items_res["status"],
-                      "duration_ms": items_res["duration_ms"],
-                      "ok": ok,
-                      "feature_count": len(features) if isinstance(features, list) else None,
-                      "property_keys": sorted(list(props.keys()))[:30] if isinstance(props, dict) else [],
-                  })
-                  if ok and chosen_good is None:
-                      chosen_good = collection_attempts[-1]
-
-              add_result(
-                  "pdok_bag_ogc_items",
-                  "official-api",
-                  "https://api.pdok.nl/kadaster/bag/ogc/v2/collections/{id}/items?limit=5&f=json",
-                  "pass" if chosen_good else "fail",
-                  "BAG OGC returned features from at least one address-like collection." if chosen_good else "BAG OGC did not return features from tested collections.",
-                  chosen_good["status"] if chosen_good else None,
-                  chosen_good["duration_ms"] if chosen_good else None,
-                  {
-                      "collection_attempts": collection_attempts,
-                      "winning_collection": chosen_good,
-                  },
-              )
-
-
-          def check_kadaster_bag():
-              openapi_url = "https://api.bag.kadaster.nl/lvbag/individuelebevragingen/v2/openapi.yaml"
-              openapi_res = request_url(openapi_url)
-              openapi_ok = openapi_res["status"] == 200 and "/adresseerbareobjecten" in openapi_res["text"]
-
-              add_result(
-                  "kadaster_bag_openapi",
-                  "official-api",
-                  openapi_url,
-                  "pass" if openapi_ok else "fail",
-                  "Kadaster BAG OpenAPI spec reachable." if openapi_ok else "Kadaster BAG OpenAPI spec not reachable.",
-                  openapi_res["status"],
-                  openapi_res["duration_ms"],
-                  {"preview": openapi_res["text"][:400]},
-              )
-
-              lookup_url = "https://api.bag.kadaster.nl/lvbag/individuelebevragingen/v2/adresseerbareobjecten?postcode=1012LG&huisnummer=1"
-
-              if not BAG_API_KEY:
-                  add_result(
-                      "kadaster_bag_lookup",
-                      "official-api",
-                      lookup_url,
-                      "skip",
-                      "BAG_API_KEY not configured.",
-                      None,
-                      None,
-                      {},
-                  )
-                  return
-
-              res = request_url(
-                  lookup_url,
-                  headers={
-                      "Accept": "application/json",
-                      "X-Api-Key": BAG_API_KEY,
-                  },
-              )
-              parsed = try_json(res["text"])
-              good = False
-              details = {}
-
-              if parsed is not None:
-                  blob = json.dumps(parsed)[:2000].lower()
-                  good = res["status"] == 200 and any(x in blob for x in ["postcode", "huisnummer", "_embedded", "nummeraanduiding", "adresseer"])
-                  details = {
-                      "top_level_type": type(parsed).__name__,
-                      "top_level_keys": list(parsed.keys())[:20] if isinstance(parsed, dict) else [],
-                  }
-
-              add_result(
-                  "kadaster_bag_lookup",
-                  "official-api",
-                  lookup_url,
-                  "pass" if good else "fail",
-                  "Kadaster BAG lookup returned structured data." if good else "Kadaster BAG lookup failed or returned unexpected content.",
-                  res["status"],
-                  res["duration_ms"],
-                  details or {"error": res["error"], "preview": res["text"][:500]},
-              )
-
-
-          def discover_openaddresses_data_url():
-              source_url = "https://raw.githubusercontent.com/openaddresses/openaddresses/master/sources/nl/countrywide.json"
-              res = request_url(source_url)
-              parsed = try_json(res["text"])
-              if not (res["status"] == 200 and isinstance(parsed, dict)):
-                  add_result(
-                      "openaddresses_source_config",
-                      "dataset-meta",
-                      source_url,
-                      "fail",
-                      "OpenAddresses NL source config not readable.",
-                      res["status"],
-                      res["duration_ms"],
-                      {"error": res["error"], "preview": res["text"][:500]},
-                  )
-                  return None
-
-              data_url = None
-              if isinstance(parsed.get("data"), str):
-                  data_url = parsed.get("data")
-
-              layers = parsed.get("layers")
-              if data_url is None and isinstance(layers, dict):
-                  for _, v in layers.items():
-                      if isinstance(v, list):
-                          for item in v:
-                              if isinstance(item, dict) and isinstance(item.get("data"), str):
-                                  data_url = item["data"]
-                                  break
-                      elif isinstance(v, dict) and isinstance(v.get("data"), str):
-                          data_url = v["data"]
-                      if data_url:
-                          break
-
-              add_result(
-                  "openaddresses_source_config",
-                  "dataset-meta",
-                  source_url,
-                  "pass" if bool(data_url) else "fail",
-                  "OpenAddresses source config parsed." if data_url else "OpenAddresses source config parsed but no data URL found.",
-                  res["status"],
-                  res["duration_ms"],
-                  {"data_url": data_url},
-              )
-              return data_url
-
-
-          def build_github_dataset_urls(owner, repo, manual_urls):
-              discovered_urls, discovery = discover_github_repo_artifacts(owner, repo)
-
-              add_result(
-                  f"github_discovery_{owner}_{repo}",
-                  "dataset-meta",
-                  f"https://api.github.com/repos/{owner}/{repo}",
-                  "pass",
-                  "GitHub discovery completed.",
-                  discovery.get("repo_status"),
-                  None,
-                  discovery,
-              )
-
-              urls = []
-              for u in manual_urls:
-                  urls.append({"url": u, "source": "manual"})
-              for u in discovered_urls:
-                  urls.append({"url": u, "source": "github_api_discovered"})
-              return urls
-
-
-          def test_all_datasets():
-              openaddresses_data_url = discover_openaddresses_data_url()
-
-              openaddresses_urls = []
-              if openaddresses_data_url:
-                  openaddresses_urls.append({"url": openaddresses_data_url, "source": "openaddresses_config"})
-              openaddresses_urls.append({"url": "https://results.openaddresses.io/latest/run/nl/countrywide/addresses.csv.zip", "source": "openaddresses_results"})
-
-              test_candidate_urls("openaddresses_nl", dedupe_urls([u["url"] for u in openaddresses_urls]))
-              # rebuild with source tags preserved
-              openaddresses_urls = [{"url": u["url"], "source": u["source"]} for u in openaddresses_urls]
-              test_candidate_urls("openaddresses_nl_with_sources", openaddresses_urls)
-
-              mevdschee_urls = build_github_dataset_urls(
-                  "mevdschee",
-                  "postcodes-nl-geo",
-                  [
-                      "https://github.com/mevdschee/postcodes-nl-geo/releases/latest/download/postcodes_nl.csv.gz",
-                      "https://github.com/mevdschee/postcodes-nl-geo/releases/latest/download/postcodes_nl.txt.gz",
-                      "https://raw.githubusercontent.com/mevdschee/postcodes-nl-geo/master/postcodes_nl.csv",
-                      "https://raw.githubusercontent.com/mevdschee/postcodes-nl-geo/master/postcodes_nl.txt",
-                      "https://raw.githubusercontent.com/mevdschee/postcodes-nl-geo/main/postcodes_nl.csv",
-                      "https://raw.githubusercontent.com/mevdschee/postcodes-nl-geo/main/postcodes_nl.txt",
-                  ],
-              )
-              test_candidate_urls("github_mevdschee_postcodes_nl_geo", mevdschee_urls)
-
-              ljpc_urls = build_github_dataset_urls(
-                  "LJPc-solutions",
-                  "Nederlandse-adressen-en-postcodes",
-                  [
-                      "https://github.com/LJPc-solutions/Nederlandse-adressen-en-postcodes/releases/latest/download/adressen.csv.zst",
-                      "https://github.com/LJPc-solutions/Nederlandse-adressen-en-postcodes/releases/latest/download/postcodes.csv.zst",
-                      "https://github.com/LJPc-solutions/Nederlandse-adressen-en-postcodes/releases/latest/download/nederlandse-adressen.csv.zst",
-                      "https://github.com/LJPc-solutions/Nederlandse-adressen-en-postcodes/releases/latest/download/nederlandse-postcodes.csv.zst",
-                  ],
-              )
-              test_candidate_urls("github_ljpc_nederlandse_adressen_en_postcodes", ljpc_urls)
-
-              jorritb_urls = build_github_dataset_urls(
-                  "jorritb",
-                  "dutch-postal-codes",
-                  [
-                      "https://raw.githubusercontent.com/jorritb/dutch-postal-codes/master/data.csv",
-                      "https://raw.githubusercontent.com/jorritb/dutch-postal-codes/main/data.csv",
-                      "https://raw.githubusercontent.com/jorritb/dutch-postal-codes/master/postcodes.csv",
-                      "https://raw.githubusercontent.com/jorritb/dutch-postal-codes/main/postcodes.csv",
-                      "https://raw.githubusercontent.com/jorritb/dutch-postal-codes/master/dutch-postal-codes.csv",
-                      "https://raw.githubusercontent.com/jorritb/dutch-postal-codes/main/dutch-postal-codes.csv",
-                  ],
-              )
-              test_candidate_urls("github_jorritb_dutch_postal_codes", jorritb_urls)
-
-
-          def render_summary():
-              passes = sum(1 for r in RESULTS if r["verdict"] == "pass")
-              warns = sum(1 for r in RESULTS if r["verdict"] == "warn")
-              fails = sum(1 for r in RESULTS if r["verdict"] == "fail")
-              skips = sum(1 for r in RESULTS if r["verdict"] == "skip")
-
-              lines = []
-              lines.append("# NL address options verbose matrix")
-              lines.append("")
-              lines.append(f"- Generated: `{now_iso()}`")
-              lines.append(f"- BAG API key present: `{bool(BAG_API_KEY)}`")
-              lines.append(f"- Results: pass={passes}, warn={warns}, fail={fails}, skip={skips}")
-              lines.append("")
-
-              lines.append("## Result summary")
-              lines.append("")
-              lines.append("| Key | Category | Verdict | Status | Notes |")
-              lines.append("|---|---|---|---:|---|")
-              for r in RESULTS:
-                  st = "" if r["status"] is None else str(r["status"])
-                  note = r["notes"].replace("|", "\\|")
-                  lines.append(f"| `{r['key']}` | {r['category']} | **{r['verdict']}** | {st} | {note} |")
-
-              lines.append("")
-              lines.append("## Attempt matrix")
-              lines.append("")
-              lines.append("| Dataset | Source | URL | Status | Duration ms | Error |")
-              lines.append("|---|---|---|---:|---:|---|")
-              for a in ATTEMPTS:
-                  st = "" if a["status"] is None else str(a["status"])
-                  dur = "" if a["duration_ms"] is None else str(a["duration_ms"])
-                  err = "" if not a["error"] else str(a["error"]).replace("|", "\\|")
-                  src = a.get("source", "")
-                  url = a["url"].replace("|", "%7C")
-                  lines.append(f"| `{a['dataset_key']}` | `{src}` | `{url}` | {st} | {dur} | {err} |")
-
-              return "\n".join(lines) + "\n"
-
-
-          def main():
-              check_pdok_locatieserver()
-              check_pdok_locatieserver_suggest()
-              check_pdok_bag_ogc()
-              check_kadaster_bag()
-              test_all_datasets()
-
-              report = {
-                  "generated_at": now_iso(),
-                  "bag_api_key_present": bool(BAG_API_KEY),
-                  "results": RESULTS,
-                  "attempts": ATTEMPTS,
-              }
-
-              with open("nl-address-options-report.json", "w", encoding="utf-8") as f:
-                  json.dump(report, f, indent=2, ensure_ascii=False)
-
-              with open("nl-address-options-summary.md", "w", encoding="utf-8") as f:
-                  f.write(render_summary())
-
-              print(json.dumps(report, indent=2, ensure_ascii=False))
-
-              required_fail_keys = {
-                  "pdok_locatieserver_free",
-                  "pdok_locatieserver_suggest",
-                  "pdok_bag_ogc_collections",
-                  "pdok_bag_ogc_items",
-              }
-
-              hard_fails = [
-                  r for r in RESULTS
-                  if r["verdict"] == "fail" and r["key"] in required_fail_keys
-              ]
-
-              if hard_fails:
-                  print("Required failures detected:", file=sys.stderr)
-                  for r in hard_fails:
-                      print(f"- {r['key']}: {r['notes']}", file=sys.stderr)
-                  return 1
-
-              return 0
-
-
-          if __name__ == "__main__":
-              raise SystemExit(main())
+                          count += 1
+                          if random.randrange(count) == 0:
+                              chosen = row
+
+                      if chosen is None:
+                          raise RuntimeError("No usable address rows found.")
+
+                      return chosen
+
+          row = random_address_from_zstd_csv(URL)
+
+          address = " ".join(
+              x for x in [
+                  row.get("straat", "").strip(),
+                  row.get("huisnummer", "").strip(),
+                  row.get("huisletter", "").strip(),
+                  row.get("huisnummertoevoeging", "").strip(),
+              ] if x
+          ).strip()
+
+          result = {
+              "address": address,
+              "postcode": row.get("postcode", "").strip(),
+              "woonplaats": row.get("woonplaats", "").strip(),
+              "gemeente": row.get("gemeente", "").strip(),
+              "provincie": row.get("provincie", "").strip(),
+              "lat": row.get("lat", "").strip(),
+              "lon": row.get("lon", "").strip(),
+              "source_url": URL,
+          }
+
+          print(json.dumps(result, indent=2, ensure_ascii=False))
+
+          with open("random-nl-house.json", "w", encoding="utf-8") as f:
+              json.dump(result, f, indent=2, ensure_ascii=False)
+
+          with open("random-nl-house.txt", "w", encoding="utf-8") as f:
+              f.write("Random Dutch address\n")
+              f.write(f"{result['address']}\n")
+              f.write(f"{result['postcode']} {result['woonplaats']}\n")
+              f.write(f"Gemeente: {result['gemeente']}\n")
+              f.write(f"Provincie: {result['provincie']}\n")
+              f.write(f"Lat/Lon: {result['lat']} {result['lon']}\n")
+              f.write(f"Source: {result['source_url']}\n")
           PY
 
-          python check_nl_address_options.py
+          python random_nl_house.py
 
-      - name: Add summary to job output
+      - name: Add result to job summary
         if: always()
         shell: bash
-        run: cat nl-address-options-summary.md >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          {
+            echo "# Random Dutch house"
+            echo
+            cat random-nl-house.txt
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload JSON report
+      - name: Upload JSON artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nl-address-options-report-json
-          path: nl-address-options-report.json
+          name: random-nl-house-json
+          path: random-nl-house.json
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Upload markdown summary
+      - name: Upload text artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nl-address-options-report-markdown
-          path: nl-address-options-summary.md
+          name: random-nl-house-text
+          path: random-nl-house.txt
           if-no-files-found: warn
           retention-days: 14
