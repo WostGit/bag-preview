@@ -1,4 +1,4 @@
-name: Random Dutch house from LJPc dataset
+name: Random Dutch house from cached LJPc dataset
 
 on:
   workflow_dispatch:
@@ -13,6 +13,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    env:
+      DATASET_URL: https://raw.githubusercontent.com/LJPc-solutions/Nederlandse-adressen-en-postcodes/main/Nederland.csv.zst
+      DATASET_DIR: .cache/nl-addresses
+      DATASET_FILE: .cache/nl-addresses/Nederland.csv.zst
+
     steps:
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,6 +31,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install zstandard
 
+      - name: Restore cached dataset
+        id: cache-dataset
+        uses: actions/cache@v4
+        with:
+          path: .cache/nl-addresses
+          key: ${{ runner.os }}-nl-addresses-ljpc-nederland-v1
+          restore-keys: |
+            ${{ runner.os }}-nl-addresses-ljpc-
+
+      - name: Download dataset on cache miss
+        if: steps.cache-dataset.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$DATASET_DIR"
+          curl -L --fail --retry 3 --retry-delay 2 \
+            -A "random-nl-house-github-action/1.1" \
+            "$DATASET_URL" \
+            -o "$DATASET_FILE"
+          ls -lh "$DATASET_FILE"
+
       - name: Pick a random Dutch house
         shell: bash
         run: |
@@ -35,18 +61,16 @@ jobs:
           import csv
           import io
           import json
+          import os
           import random
-          import urllib.request
           import zstandard as zstd
 
-          URL = "https://raw.githubusercontent.com/LJPc-solutions/Nederlandse-adressen-en-postcodes/main/Nederland.csv.zst"
-          USER_AGENT = "random-nl-house-github-action/1.0"
+          DATASET_FILE = os.environ["DATASET_FILE"]
 
-          def random_address_from_zstd_csv(url: str) -> dict:
-              req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-              with urllib.request.urlopen(req, timeout=120) as resp:
+          def random_address_from_local_zstd_csv(path: str) -> dict:
+              with open(path, "rb") as f:
                   dctx = zstd.ZstdDecompressor()
-                  with dctx.stream_reader(resp) as reader:
+                  with dctx.stream_reader(f) as reader:
                       text_stream = io.TextIOWrapper(reader, encoding="utf-8", newline="")
                       csv_reader = csv.DictReader(text_stream, delimiter=";")
 
@@ -54,7 +78,10 @@ jobs:
                       count = 0
 
                       for row in csv_reader:
-                          if not row.get("postcode") or not row.get("huisnummer") or not row.get("straat"):
+                          straat = (row.get("straat") or "").strip()
+                          huisnummer = (row.get("huisnummer") or "").strip()
+                          postcode = (row.get("postcode") or "").strip()
+                          if not straat or not huisnummer or not postcode:
                               continue
 
                           count += 1
@@ -66,26 +93,36 @@ jobs:
 
                       return chosen
 
-          row = random_address_from_zstd_csv(URL)
+          row = random_address_from_local_zstd_csv(DATASET_FILE)
+
+          straat = (row.get("straat") or "").strip()
+          huisnummer = (row.get("huisnummer") or "").strip()
+          huisletter = (row.get("huisletter") or "").strip()
+          huisnummertoevoeging = (row.get("huisnummertoevoeging") or "").strip()
+          postcode = (row.get("postcode") or "").strip()
+          woonplaats = (row.get("woonplaats") or "").strip()
+          gemeente = (row.get("gemeente") or "").strip()
+          provincie = (row.get("provincie") or "").strip()
+          lat = (row.get("lat") or "").strip()
+          lon = (row.get("lon") or "").strip()
 
           address = " ".join(
-              x for x in [
-                  row.get("straat", "").strip(),
-                  row.get("huisnummer", "").strip(),
-                  row.get("huisletter", "").strip(),
-                  row.get("huisnummertoevoeging", "").strip(),
-              ] if x
-          ).strip()
+              part for part in [straat, huisnummer, huisletter, huisnummertoevoeging] if part
+          )
 
           result = {
+              "straat": straat,
+              "huisnummer": huisnummer,
+              "huisletter": huisletter,
+              "huisnummertoevoeging": huisnummertoevoeging,
               "address": address,
-              "postcode": row.get("postcode", "").strip(),
-              "woonplaats": row.get("woonplaats", "").strip(),
-              "gemeente": row.get("gemeente", "").strip(),
-              "provincie": row.get("provincie", "").strip(),
-              "lat": row.get("lat", "").strip(),
-              "lon": row.get("lon", "").strip(),
-              "source_url": URL,
+              "postcode": postcode,
+              "woonplaats": woonplaats,
+              "gemeente": gemeente,
+              "provincie": provincie,
+              "lat": lat,
+              "lon": lon,
+              "dataset_file": DATASET_FILE,
           }
 
           print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -95,12 +132,17 @@ jobs:
 
           with open("random-nl-house.txt", "w", encoding="utf-8") as f:
               f.write("Random Dutch address\n")
-              f.write(f"{result['address']}\n")
-              f.write(f"{result['postcode']} {result['woonplaats']}\n")
+              f.write(f"Straat: {result['straat']}\n")
+              f.write(f"Huisnummer: {result['huisnummer']}\n")
+              f.write(f"Huisletter: {result['huisletter']}\n")
+              f.write(f"Huisnummertoevoeging: {result['huisnummertoevoeging']}\n")
+              f.write(f"Address: {result['address']}\n")
+              f.write(f"Postcode: {result['postcode']}\n")
+              f.write(f"Woonplaats: {result['woonplaats']}\n")
               f.write(f"Gemeente: {result['gemeente']}\n")
               f.write(f"Provincie: {result['provincie']}\n")
               f.write(f"Lat/Lon: {result['lat']} {result['lon']}\n")
-              f.write(f"Source: {result['source_url']}\n")
+              f.write(f"Dataset file: {result['dataset_file']}\n")
           PY
 
           python random_nl_house.py
@@ -111,6 +153,8 @@ jobs:
         run: |
           {
             echo "# Random Dutch house"
+            echo
+            echo "- Cache hit: \`${{ steps.cache-dataset.outputs.cache-hit }}\`"
             echo
             cat random-nl-house.txt
           } >> "$GITHUB_STEP_SUMMARY"
