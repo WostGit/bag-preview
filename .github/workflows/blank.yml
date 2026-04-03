@@ -1,0 +1,238 @@
+name: BAG address dataset preview
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 1"
+
+jobs:
+  bag-preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install feedparser requests
+
+      - name: Download latest full PDOK address dataset
+        env:
+          BAG_ADRESSEN_ATOM_FEED: https://service.pdok.nl/kadaster/bag-adressen/atom/index.xml
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import sys
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          import feedparser
+          import requests
+
+          out_dir = Path("bag_data")
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          feed_url = os.environ["BAG_ADRESSEN_ATOM_FEED"]
+          feed = feedparser.parse(feed_url)
+
+          links = []
+          for entry in feed.entries:
+              for link in entry.get("links", []):
+                  href = link.get("href")
+                  if href and href.startswith("http"):
+                      links.append(href)
+              href = entry.get("link")
+              if href and href.startswith("http"):
+                  links.append(href)
+
+          if not links:
+              raise SystemExit(f"No download links found in {feed_url}")
+
+          links = list(dict.fromkeys(links))
+
+          preferred = []
+          fallback = []
+          for link in links:
+              lower = link.lower()
+              if lower.endswith(".gpkg.zip") or lower.endswith(".zip"):
+                  preferred.append(link)
+              else:
+                  fallback.append(link)
+
+          if preferred:
+              download_url = sorted(preferred, key=len)[0]
+          else:
+              download_url = links[0]
+
+          print(f"Feed URL: {feed_url}")
+          print(f"Resolved download URL: {download_url}")
+
+          filename = Path(urlparse(download_url).path).name or "bag_adressen_download.zip"
+          filename = re.sub(r"[^A-Za-z0-9._-]+", "_", filename)
+          zip_path = out_dir / filename
+
+          with requests.get(download_url, stream=True, timeout=180) as r:
+              r.raise_for_status()
+              with zip_path.open("wb") as f:
+                  for chunk in r.iter_content(chunk_size=1024 * 1024):
+                      if chunk:
+                          f.write(chunk)
+
+          size = zip_path.stat().st_size
+          print(f"Downloaded: {zip_path}")
+          print(f"Size bytes: {size}")
+
+          if size < 1024:
+              raise SystemExit("Downloaded file is unexpectedly small")
+
+          with zip_path.open("rb") as f:
+              head = f.read(512).lower()
+              if b"<html" in head:
+                  raise SystemExit("Download looks like an HTML error page, not a dataset")
+
+          with zipfile.ZipFile(zip_path, "r") as zf:
+              names = zf.namelist()
+              if not names:
+                  raise SystemExit("ZIP file is empty")
+              bad = zf.testzip()
+              if bad is not None:
+                  raise SystemExit(f"ZIP file is corrupt at member: {bad}")
+              zf.extractall(out_dir / "unzipped")
+
+          print("Top-level extracted files:")
+          for p in sorted((out_dir / "unzipped").rglob("*")):
+              if p.is_file():
+                  print(f" - {p}")
+
+          gpkg_files = list((out_dir / "unzipped").rglob("*.gpkg"))
+          if not gpkg_files:
+              raise SystemExit("No .gpkg file found after extraction")
+
+          gpkg_path = gpkg_files[0]
+          print(f"GPKG_PATH={gpkg_path}", file=open(os.environ["GITHUB_ENV"], "a"))
+          print(f"ZIP_PATH={zip_path}", file=open(os.environ["GITHUB_ENV"], "a"))
+          print(f"Using GeoPackage: {gpkg_path}")
+          PY
+
+      - name: Preview schema and sample addresses
+        run: |
+          python - <<'PY'
+          import os
+          import sqlite3
+          from pathlib import Path
+
+          gpkg_path = Path(os.environ["GPKG_PATH"])
+          if not gpkg_path.exists():
+              raise SystemExit(f"GeoPackage not found: {gpkg_path}")
+
+          conn = sqlite3.connect(str(gpkg_path))
+          conn.row_factory = sqlite3.Row
+
+          def quote_ident(name: str) -> str:
+              return '"' + name.replace('"', '""') + '"'
+
+          tables = [
+              r["table_name"]
+              for r in conn.execute(
+                  "SELECT table_name FROM gpkg_contents ORDER BY table_name"
+              ).fetchall()
+          ]
+
+          if not tables:
+              raise SystemExit("No tables found in GeoPackage")
+
+          print("=== TABLES ===")
+          for t in tables:
+              print("-", t)
+
+          chosen_table = None
+          chosen_columns = None
+
+          score_keywords = {
+              "postcode": 5,
+              "huisnummer": 5,
+              "openbareruimtenaam": 3,
+              "straat": 3,
+              "woonplaatsnaam": 3,
+              "nummeraanduiding": 2,
+          }
+
+          best_score = -1
+
+          for table in tables:
+              cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({quote_ident(table)})")]
+              lower_cols = {c.lower(): c for c in cols}
+              score = 0
+              for key, pts in score_keywords.items():
+                  if key in lower_cols:
+                      score += pts
+              if score > best_score:
+                  best_score = score
+                  chosen_table = table
+                  chosen_columns = cols
+
+          if not chosen_table or not chosen_columns:
+              raise SystemExit("Could not determine a suitable address table")
+
+          print("\n=== CHOSEN TABLE ===")
+          print(chosen_table)
+
+          print("\n=== COLUMNS ===")
+          for c in chosen_columns:
+              print("-", c)
+
+          lower_map = {c.lower(): c for c in chosen_columns}
+
+          postcode_col = lower_map.get("postcode")
+          huisnummer_col = lower_map.get("huisnummer")
+          straat_col = lower_map.get("openbareruimtenaam") or lower_map.get("straat")
+          woonplaats_col = lower_map.get("woonplaatsnaam")
+
+          if not postcode_col or not huisnummer_col:
+              raise SystemExit(
+                  f"Required columns not found in {chosen_table}. "
+                  f"Need at least postcode and huisnummer."
+              )
+
+          select_cols = [c for c in [straat_col, huisnummer_col, postcode_col, woonplaats_col] if c]
+          select_expr = ", ".join(quote_ident(c) for c in select_cols)
+          table_expr = quote_ident(chosen_table)
+
+          print("\n=== PREVIEW (first 10 rows) ===")
+          q1 = f"SELECT {select_expr} FROM {table_expr} LIMIT 10"
+          rows = conn.execute(q1).fetchall()
+          for i, row in enumerate(rows, 1):
+              print(f"{i:02d} | " + " | ".join(str(row[c]) for c in select_cols))
+
+          print("\n=== RANDOM SAMPLE OF 10 ADDRESSES ===")
+          where_parts = [
+              f"{quote_ident(postcode_col)} IS NOT NULL",
+              f"{quote_ident(huisnummer_col)} IS NOT NULL",
+          ]
+          if straat_col:
+              where_parts.append(f"{quote_ident(straat_col)} IS NOT NULL")
+          if woonplaats_col:
+              where_parts.append(f"{quote_ident(woonplaats_col)} IS NOT NULL")
+
+          where_clause = " AND ".join(where_parts)
+
+          q2 = f"""
+              SELECT {select_expr}
+              FROM {table_expr}
+              WHERE {where_clause}
+              ORDER BY RANDOM()
+              LIMIT 10
+          """
+          rows = conn.execute(q2).fetchall()
+          for i, row in enumerate(rows, 1):
+              print(f"{i:02d} | " + " | ".join(str(row[c]) for c in select_cols))
+
+          conn.close()
+          PY
